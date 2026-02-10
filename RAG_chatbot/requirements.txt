@@ -11,5 +11,7 @@ protobuf>=4.21.0,<6.0.0
 # Flask API
 flask>=2.3.0
 flask-cors>=4.0.0
+# Qdrant vector database
+qdrant-client>=1.7.0
 
 

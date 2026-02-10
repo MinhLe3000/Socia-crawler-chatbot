@@ -88,15 +88,14 @@ def check_gemini_key():
 def check_mongodb():
     """Kiểm tra kết nối MongoDB và dữ liệu."""
     print("\n" + "=" * 60)
-    print("4. KIỂM TRA MONGODB")
+    print("4. KIỂM TRA MONGODB & QDRANT")
     print("=" * 60)
     
     try:
-        from src.utils.config import get_mongo_client, MONGO_DB_NAME, MONGO_DB_SOURCE
+        from src.utils.config import get_mongo_client, MONGO_DB_SOURCE, get_qdrant_client, QDRANT_COLLECTION_NAME
         
+        # Kiểm tra MongoDB (dữ liệu nguồn)
         client = get_mongo_client()
-        
-        # Kiểm tra kết nối
         client.admin.command('ping')
         print("✅ Kết nối MongoDB thành công")
         
@@ -105,42 +104,58 @@ def check_mongodb():
         posts_count = source_db.posts.count_documents({})
         comments_count = source_db.comments.count_documents({})
         
-        print(f"   Database '{MONGO_DB_SOURCE}' (source):")
+        print(f"   MongoDB - Database '{MONGO_DB_SOURCE}' (source):")
         print(f"     - Posts: {posts_count}")
         print(f"     - Comments: {comments_count}")
-        
-        # Đọc knowledge_base từ database Chatbot (target)
-        target_db = client[MONGO_DB_NAME]
-        kb_count = target_db.knowledge_base.count_documents({})
-        
-        print(f"   Database '{MONGO_DB_NAME}' (target):")
-        print(f"     - Knowledge Base: {kb_count}")
         
         if posts_count == 0 and comments_count == 0:
             print("⚠️  Chưa có dữ liệu trong MongoDB (posts và comments)")
             return False
         
-        # Kiểm tra embeddings trong knowledge_base
-        with_embeddings = target_db.knowledge_base.count_documents({"embedding": {"$exists": True}})
-        print(f"     - Documents có embeddings: {with_embeddings}/{kb_count}")
+        # Kiểm tra Qdrant (knowledge base)
+        qdrant_client = get_qdrant_client()
         
-        if kb_count == 0:
-            print("⚠️  Chưa có knowledge_base. Chạy: python scripts/index_mongo.py")
+        try:
+            collection_info = qdrant_client.get_collection(QDRANT_COLLECTION_NAME)
+            total_points = collection_info.points_count
+            print(f"\n✅ Kết nối Qdrant thành công")
+            print(f"   Qdrant - Collection '{QDRANT_COLLECTION_NAME}':")
+            print(f"     - Total points: {total_points}")
+            
+            # Đếm số points có embedding thực (không phải zero vector)
+            points_sample, _ = qdrant_client.scroll(
+                collection_name=QDRANT_COLLECTION_NAME,
+                limit=100,
+                with_payload=True,
+                with_vectors=True,
+            )
+            
+            if points_sample:
+                embedded_count = sum(1 for p in points_sample if p.vector and sum(p.vector) != 0)
+                estimated_embedded = int((embedded_count / len(points_sample)) * total_points)
+                print(f"     - Points có embeddings: ~{estimated_embedded}/{total_points} (estimated)")
+                
+                if total_points == 0:
+                    print("⚠️  Chưa có knowledge_base trong Qdrant. Chạy: python scripts/index_mongo.py")
+                    return False
+                
+                if embedded_count == 0:
+                    print("⚠️  Chưa có embeddings. Chạy: python scripts/embed_bge_m3.py")
+                    return False
+                
+                if embedded_count < len(points_sample):
+                    print(f"⚠️  Một số documents chưa có embeddings")
+                    print("   Chạy lại: python scripts/embed_bge_m3.py")
+            
+        except Exception as e:
+            print(f"❌ Lỗi kết nối Qdrant: {e}")
+            print(f"   Kiểm tra QDRANT_URL và QDRANT_KEY trong .env hoặc src/utils/config.py")
             return False
-        
-        if with_embeddings == 0:
-            print("⚠️  Chưa có embeddings. Chạy: python scripts/embed_bge_m3.py")
-            return False
-        
-        if with_embeddings < kb_count:
-            print(f"⚠️  Chỉ có {with_embeddings}/{kb_count} documents có embeddings")
-            print("   Chạy lại: python scripts/embed_bge_m3.py")
         
         return True
         
     except Exception as e:
-        print(f"❌ Lỗi kết nối MongoDB: {e}")
-        print("   Kiểm tra MONGO_URI trong src/utils/config.py")
+        print(f"❌ Lỗi: {e}")
         return False
 
 
