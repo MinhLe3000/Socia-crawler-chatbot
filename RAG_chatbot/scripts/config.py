@@ -1,33 +1,23 @@
-"""Configuration for MongoDB and Qdrant connections."""
+"""
+Thin re-export so scripts can still do ``from config import ...``.
 
-import os
-from dotenv import load_dotenv
-from pymongo import MongoClient
-from qdrant_client import QdrantClient
+All actual values live in src/utils/config.py (the single source of truth).
+"""
 
-load_dotenv()
+import sys
+from pathlib import Path
 
-# MongoDB Configuration
-MONGO_URI = os.getenv("MONGO_URI")
-MONGO_DB_SOURCE = "chatbotNeu"  # Database chứa posts và comments
-MONGO_DB_NAME = "chatbotNeu"  # Database chatbot
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
-# Qdrant Configuration
-QDRANT_URL = os.getenv(
-    "QDRANT_URL"
+from src.utils.config import (  # noqa: E402, F401
+    MONGO_URI,
+    MONGO_DB_SOURCE,
+    MONGO_DB_NAME,
+    QDRANT_URL,
+    QDRANT_KEY,
+    QDRANT_COLLECTION_NAME,
+    get_mongo_client,
+    get_qdrant_client,
 )
-QDRANT_KEY = os.getenv("QDRANT_KEY")
-QDRANT_COLLECTION_NAME = "knowledge_base"
-
-
-def get_mongo_client() -> MongoClient:
-    """Get MongoDB client."""
-    return MongoClient(MONGO_URI)
-
-
-def get_qdrant_client() -> QdrantClient:
-    """Get Qdrant client."""
-    return QdrantClient(
-        url=QDRANT_URL,
-        api_key=QDRANT_KEY,
-    )

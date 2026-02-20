@@ -17,15 +17,12 @@ def build_knowledge_documents() -> int:
     """
     Build knowledge base from MongoDB posts and comments.
     
-    Đọc posts và comments từ database 'Postandcmt'
-    Lưu vào Qdrant collection 'knowledge_base'
-    
-    Normalizes posts and comments into a unified format for RAG.
+    Reads posts and comments from the source DB configured in .env
+    (MONGO_DB_SOURCE) and stores them into the Qdrant collection.
     """
     mongo_client = get_mongo_client()
     qdrant_client = get_qdrant_client()
     
-    # Đọc dữ liệu nguồn từ database Postandcmt
     source_db = mongo_client[MONGO_DB_SOURCE]
     posts_col = source_db["posts"]
     comments_col = source_db["comments"]
