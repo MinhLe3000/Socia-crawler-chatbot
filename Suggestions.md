@@ -54,6 +54,42 @@ Tài liệu này tổng hợp các hạn chế, rủi ro kỹ thuật và đề 
 - **Vấn đề:** Scripts trong `RAG_chatbot/scripts` (index, embed) chủ yếu procedural, ít tái sử dụng code từ `src/`.
 - **Rủi ro:** Logic truy vấn Mongo / build document cho Qdrant có thể trùng lặp; sửa một nơi dễ quên cập nhật nơi kia.
 
+### 1.7. Tài liệu API không khớp với code thực tế
+
+- **Vấn đề:** `RAG_chatbot/API_GUIDE.md` mô tả hệ thống là **Flask API** (tiêu đề: "HƯỚNG DẪN CHẠY FLASK API"), nhưng code trong `app.py` thực tế sử dụng **FastAPI**.
+- **Hệ quả:**
+  - Gây nhầm lẫn cho người mới tham gia dự án.
+  - Hướng dẫn thay đổi port viết `app.run(host="0.0.0.0", port=5001)` (cú pháp Flask), nhưng code dùng `uvicorn.run(...)`.
+- **Rủi ro:** Người dùng làm theo tài liệu sẽ không debug đúng cách khi gặp lỗi.
+
+### 1.8. Cấu hình CORS quá mở
+
+- **Vấn đề:** `app.py` cấu hình `allow_origins=["*"]`, cho phép mọi origin truy cập API.
+- **Rủi ro:**
+  - Trong môi trường production, bất kỳ website nào cũng có thể gọi API.
+  - Kết hợp với MongoDB URI bị hardcode, đây là lỗ hổng bảo mật đáng kể.
+
+### 1.9. Thiếu pipeline xử lý và làm sạch dữ liệu
+
+- **Vấn đề:** Dữ liệu từ Facebook Group rất nhiễu (emoji spam, link rác, teen code, comments vô nghĩa như "oke", ".", "đã xem"), nhưng hệ thống chỉ `.strip()` và thay rỗng bằng `[NO_MESSAGE]`.
+- **Hệ quả:**
+  - RAG retrieval trả về kết quả nhiễu, giảm chất lượng câu trả lời.
+  - LLM phải xử lý context chứa nhiều thông tin rác, tốn token.
+- **Rủi ro:** "Garbage in, garbage out" — chất lượng chatbot phụ thuộc trực tiếp vào chất lượng dữ liệu.
+
+### 1.10. Thiếu evaluation metrics và monitoring
+
+- **Vấn đề:**
+  - Không có cách đo lường chất lượng retrieval (Recall@K, MRR, nDCG).
+  - Không có cách đánh giá chất lượng câu trả lời (human evaluation).
+  - Không có logging hệ thống hay dashboard theo dõi.
+- **Rủi ro:** Không biết được các tham số (dense_weight=0.7, sparse_weight=0.3, top_k=5) có tối ưu hay không; không phát hiện được degradation theo thời gian.
+
+### 1.11. Sử dụng API deprecated trong FastAPI
+
+- **Vấn đề:** `app.py` dùng `@app.on_event("startup")` — đã deprecated từ FastAPI 0.103+.
+- **Rủi ro:** Sẽ bị loại bỏ trong các phiên bản FastAPI tương lai, gây lỗi khi upgrade.
+
 ---
 
 ## 2. Đề xuất cải thiện
@@ -106,15 +142,72 @@ Tài liệu này tổng hợp các hạn chế, rủi ro kỹ thuật và đề 
   - Cân nhắc **`pyproject.toml`** cho metadata và dependency (theo chuẩn PEP 518/621).
   - Có thể giữ `requirements.txt` sinh từ `pyproject.toml` hoặc dùng trực tiếp `pip install -e .` cho development.
 
+### 2.7. Cập nhật tài liệu API cho đúng thực tế (ưu tiên cao)
+
+- **Mục tiêu:** Tài liệu phản ánh chính xác framework và cách vận hành.
+- **Gợi ý:**
+  - Đổi tiêu đề `API_GUIDE.md` từ "Flask" sang "FastAPI".
+  - Cập nhật hướng dẫn thay đổi port sang cú pháp `uvicorn.run(...)`.
+  - Bổ sung link đến FastAPI docs tự động (`/docs`, `/redoc`).
+
+### 2.8. Siết chặt cấu hình CORS (ưu tiên trung bình)
+
+- **Mục tiêu:** Chỉ cho phép origin hợp lệ truy cập API.
+- **Gợi ý:**
+  - Thay `allow_origins=["*"]` bằng danh sách origin cụ thể (đọc từ biến môi trường).
+  - Ví dụ: `ALLOWED_ORIGINS=http://localhost:3000,https://yourdomain.com`.
+  - Trong development có thể giữ `["*"]` nhưng cần có flag phân biệt môi trường.
+
+### 2.9. Xây dựng pipeline làm sạch dữ liệu (ưu tiên cao)
+
+- **Mục tiêu:** Nâng cao chất lượng dữ liệu đầu vào cho RAG.
+- **Gợi ý:**
+  - Tạo module `src/utils/text_cleaning.py` với các bước:
+    - Loại bỏ emoji spam (giữ tối đa 2 emoji).
+    - Loại bỏ URL, số điện thoại, mã giới thiệu.
+    - Lọc bỏ messages quá ngắn (< 5 từ có nghĩa) hoặc vô nghĩa.
+    - Normalize teen code cơ bản (vd: "dc" -> "được", "mk" -> "mình").
+  - Tích hợp vào bước `scripts/index_mongo.py` trước khi đưa vào Qdrant.
+  - Thêm deduplication cho các comments gần giống nhau.
+
+### 2.10. Bổ sung evaluation metrics và monitoring (ưu tiên trung bình)
+
+- **Mục tiêu:** Đo lường và cải thiện chất lượng hệ thống theo thời gian.
+- **Gợi ý:**
+  - Tạo test set 20-30 câu hỏi mẫu của sinh viên, đánh giá Recall@K và answer quality.
+  - Thêm logging cho mỗi query: câu hỏi, top scores, thời gian xử lý.
+  - Cân nhắc thêm feedback cơ bản (thumbs up/down) cho câu trả lời.
+  - A/B test các tham số (dense_weight, sparse_weight, top_k) dựa trên test set.
+
+### 2.11. Thay thế deprecated API (ưu tiên thấp)
+
+- **Mục tiêu:** Sẵn sàng cho upgrade FastAPI.
+- **Gợi ý:**
+  - Thay `@app.on_event("startup")` bằng **lifespan context manager** (chuẩn mới của FastAPI).
+  - Ví dụ:
+    ```python
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Startup
+        get_retriever()
+        get_gemini_model()
+        yield
+        # Shutdown (cleanup nếu cần)
+
+    app = FastAPI(lifespan=lifespan)
+    ```
+
 ---
 
 ## 3. Tóm tắt ưu tiên
 
-| Ưu tiên   | Nội dung                                      |
-|----------|-----------------------------------------------|
-| **Cao**  | Chuẩn hóa config; bỏ hardcode secrets; sửa requirements |
-| **Trung bình** | Giảm trùng lặp scripts/src; thêm test cơ bản   |
-| **Thấp** | Chuẩn hóa dependency (pyproject.toml, v.v.)   |
+| Ưu tiên        | Nội dung                                                                                        |
+|---------------|-----------------------------------------------------------------------------------------------|
+| **Cao**       | Chuẩn hóa config; bỏ hardcode secrets; sửa requirements; cập nhật tài liệu API; data cleaning pipeline |
+| **Trung bình** | Giảm trùng lặp scripts/src; thêm test cơ bản; siết CORS; evaluation metrics & monitoring       |
+| **Thấp**      | Chuẩn hóa dependency (pyproject.toml); thay thế deprecated API                                 |
 
 ---
 
