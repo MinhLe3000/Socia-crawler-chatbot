@@ -156,7 +156,11 @@ if __name__ == "__main__":
         # =============================
         # ROOT COMMENTS
         # =============================
-        new_comments = get_new_root_comments(post_id, permalink)
+        try:
+            new_comments = get_new_root_comments(post_id, permalink)
+        except Exception as e:
+            print(f"⚠️  Failed to get comments for post {post_id}: {str(e)}")
+            continue
 
         for c in new_comments:
             comments_col.update_one(

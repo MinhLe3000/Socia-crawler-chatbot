@@ -29,7 +29,7 @@ REACTION_TYPES = ["LIKE", "LOVE", "HAHA", "WOW", "SAD", "ANGRY"]
 # =====================================================
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
-posts_col = db[COLLECTION_NAME]
+posts_col = db[POSTS_COLLECTION]
 
 # =====================================================
 # GET NEW POSTS (INCREMENTAL)
