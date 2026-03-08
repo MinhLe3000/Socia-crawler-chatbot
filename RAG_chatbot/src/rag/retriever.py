@@ -1,12 +1,11 @@
 """RAG retriever implementation using BGE-M3 with hybrid search."""
 
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from FlagEmbedding import BGEM3FlagModel
-from qdrant_client import QdrantClient
-
-from src.utils.config import MONGO_DB_NAME, get_mongo_client, get_qdrant_client, QDRANT_COLLECTION_NAME
+from src.utils.config import get_qdrant_client, QDRANT_COLLECTION_NAME
 
 
 def _cosine_sim(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -22,142 +21,179 @@ def _sparse_sim(query_sparse: Dict[int, float], doc_sparse: Dict[int, float]) ->
     """Calculate sparse similarity (BM25-like) between query and document."""
     if not query_sparse or not doc_sparse:
         return 0.0
-    
     score = 0.0
     for token_id, weight in query_sparse.items():
-        if token_id in doc_sparse:
-            score += weight * doc_sparse[token_id]
+        doc_weight = doc_sparse.get(token_id)
+        if doc_weight is not None:
+            score += weight * doc_weight
     return float(score)
+
+
+def _is_nonzero_vector(vec: Any) -> bool:
+    """Return True if vec is a valid dense vector and not all zeros."""
+    if vec is None:
+        return False
+    if not isinstance(vec, (list, tuple, np.ndarray)):
+        return False
+    arr = np.asarray(vec, dtype=np.float32)
+    if arr.size == 0:
+        return False
+    return bool(np.any(np.abs(arr) > 1e-12))
+
+
+# Types used for retrieval (post + comment_context + thread_summary để match câu hỏi kiểu "review thầy X")
+RETRIEVAL_TYPES = ["post", "comment_context", "thread_summary"]
+
+
+def _extract_quoted_phrases(query: str) -> List[str]:
+    """Lấy các cụm trong ngoặc kép từ query (exact phrase)."""
+    return [m.strip().lower() for m in re.findall(r'"([^"]+)"', query) if m.strip()]
 
 
 class RAGRetriever:
     """
-    RAG retriever using BGE-M3 with hybrid search (dense + sparse embeddings).
-    
-    Data flow:
-    - Posts/comments source: MongoDB (Postandcmt DB)
-    - Vector database: Qdrant (knowledge_base collection)
-    
-    Score ranges:
-    - Dense score: [-1, 1] (cosine similarity)
-    - Final hybrid score: [0, 1] (normalized combination)
+    RAG retriever using BGE-M3 with hybrid search (dense + sparse).
+
+    - Retrieval: post, comment_context, thread_summary (để match nội dung review trong comment/thread).
+    - Comments (type=comment) chỉ dùng để enrich context sau khi đã chọn post.
     """
 
     def __init__(
         self,
-        collection_name: str = None,
+        collection_name: Optional[str] = None,
         top_k: int = 5,
         min_score: Optional[float] = None,
         use_hybrid: bool = True,
         dense_weight: float = 0.7,
         sparse_weight: float = 0.3,
+        comment_limit: int = 8,
+        model_name: str = "BAAI/bge-m3",
+        use_fp16: bool = True,
     ) -> None:
-        """Initialize RAG retriever."""
         self.collection_name = collection_name or QDRANT_COLLECTION_NAME
         self.top_k = top_k
         self.min_score = min_score
         self.use_hybrid = use_hybrid
-        self.dense_weight = dense_weight
-        self.sparse_weight = sparse_weight
+        self.comment_limit = comment_limit
 
-        # Qdrant client for vector database
+        total_weight = dense_weight + sparse_weight
+        if total_weight <= 0:
+            self.dense_weight = 0.7
+            self.sparse_weight = 0.3
+        else:
+            self.dense_weight = dense_weight / total_weight
+            self.sparse_weight = sparse_weight / total_weight
+
         self.qdrant_client = get_qdrant_client()
-        
-        # Load model
-        self.model = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)
-        
-        # Load embeddings and comments from Qdrant
+        self.model = BGEM3FlagModel(model_name, use_fp16=use_fp16)
+
         self._load_embeddings_cache()
         self._load_comments_cache()
 
+    def _scroll_all_points(
+        self,
+        with_payload: bool = True,
+        with_vectors: bool = False,
+        batch_size: int = 1000,
+    ) -> List[Any]:
+        """Scroll all points from Qdrant with pagination (no payload filter — Qdrant Cloud cần index)."""
+        all_points: List[Any] = []
+        offset = None
+        while True:
+            points, offset = self.qdrant_client.scroll(
+                collection_name=self.collection_name,
+                limit=batch_size,
+                with_payload=with_payload,
+                with_vectors=with_vectors,
+                offset=offset,
+            )
+            if not points:
+                break
+            all_points.extend(points)
+            if offset is None:
+                break
+        return all_points
+
     def _load_embeddings_cache(self) -> None:
-        """Load all embeddings from Qdrant into memory cache."""
-        # Scroll through all points in Qdrant collection
-        points, _ = self.qdrant_client.scroll(
-            collection_name=self.collection_name,
-            limit=10000,  # Lấy tối đa 10k points
-            with_payload=True,
-            with_vectors=True,
-        )
-        
+        """Load embeddings for retrieval (post + comment_context + thread_summary) into RAM."""
+        points = self._scroll_all_points(with_payload=True, with_vectors=True)
+
         if not points:
             raise RuntimeError(
-                f"No embeddings found in Qdrant collection '{self.collection_name}'. "
-                "Please run scripts/index_mongo.py and scripts/embed_bge_m3.py first."
+                f"No points found in Qdrant collection '{self.collection_name}'. "
+                "Run scripts/index_mongo.py and scripts/embed_bge_m3.py first."
             )
-        
-        # Filter out points with zero vectors (chưa được embed)
+
         valid_points = []
         for p in points:
-            if p.vector and isinstance(p.vector, list) and sum(p.vector) != 0:
-                valid_points.append(p)
-        
+            payload = p.payload or {}
+            if payload.get("type") not in RETRIEVAL_TYPES:
+                continue
+            if not _is_nonzero_vector(p.vector):
+                continue
+            valid_points.append(p)
+
         if not valid_points:
             raise RuntimeError(
-                f"Found {len(points)} points in Qdrant but none have embeddings. "
-                "Please run scripts/embed_bge_m3.py to generate embeddings."
+                f"Found {len(points)} points but none have valid embeddings. "
+                "Run scripts/embed_bge_m3.py to generate embeddings."
             )
-        
-        # Extract data from Qdrant points
-        self.point_ids: List[int] = [p.id for p in valid_points]
-        self.doc_ids: List[str] = [p.payload.get("doc_id", "") for p in valid_points]
-        self.doc_texts: List[str] = [p.payload.get("text", "") for p in valid_points]
-        self.doc_sources: List[Dict[str, Any]] = [p.payload.get("source", {}) for p in valid_points]
-        
-        # Stack vectors into numpy array
-        emb_list = [np.array(p.vector, dtype=np.float32) for p in valid_points]
+
+        self.point_ids = [int(p.id) for p in valid_points]
+        self.doc_ids = [str((p.payload or {}).get("doc_id", "")) for p in valid_points]
+        self.doc_texts = [str((p.payload or {}).get("text", "")) for p in valid_points]
+        self.doc_sources = [dict((p.payload or {}).get("source", {}) or {}) for p in valid_points]
+
+        emb_list = [np.asarray(p.vector, dtype=np.float32) for p in valid_points]
         self.embeddings = np.stack(emb_list, axis=0)
-        
-        # Load sparse embeddings if hybrid mode
+
         self.sparse_embeddings: List[Dict[int, float]] = []
         if self.use_hybrid:
             for p in valid_points:
-                sparse = p.payload.get("sparse_embedding")
-                if sparse and isinstance(sparse, dict):
-                    self.sparse_embeddings.append({int(k): float(v) for k, v in sparse.items()})
+                sparse = (p.payload or {}).get("sparse_embedding")
+                if isinstance(sparse, dict) and sparse:
+                    cleaned = {}
+                    for k, v in sparse.items():
+                        try:
+                            cleaned[int(k)] = float(v)
+                        except (TypeError, ValueError):
+                            continue
+                    self.sparse_embeddings.append(cleaned)
                 else:
                     self.sparse_embeddings.append({})
-        
-        print(f"Loaded {len(self.doc_ids)} embeddings from Qdrant into RAM for RAG.")
+
+        print("RAGRetriever v2 loaded.")
+        print(f"  Collection: {self.collection_name}")
+        print(f"  Retrieval points: {len(self.doc_ids)} (post + comment_context + thread_summary)")
+        print(f"  Dense: {len(self.embeddings)}")
         if self.use_hybrid:
-            sparse_count = sum(1 for s in self.sparse_embeddings if s)
-            print(f"  - Dense embeddings: {len(self.embeddings)}")
-            print(f"  - Sparse embeddings: {sparse_count}/{len(self.sparse_embeddings)}")
+            n = sum(1 for s in self.sparse_embeddings if s)
+            print(f"  Sparse: {n}/{len(self.sparse_embeddings)}")
 
     def _load_comments_cache(self) -> None:
-        """Load comments mapping from Qdrant: post_id -> list of comments."""
-        # Load tất cả points từ Qdrant (không filter để tránh cần index)
-        points, _ = self.qdrant_client.scroll(
-            collection_name=self.collection_name,
-            limit=10000,
-            with_payload=True,
-            with_vectors=False,
-        )
-        
+        """Load comments by post_id from Qdrant (lọc type=comment trong Python)."""
+        points = self._scroll_all_points(with_payload=True, with_vectors=False)
+
         self.comments_by_post: Dict[str, List[Dict[str, Any]]] = {}
-        
-        # Filter comments trong Python
         for point in points:
-            payload = point.payload
-            # Chỉ lấy points có type="comment"
-            if payload.get("type") == "comment":
-                post_id = payload.get("source", {}).get("post_id")
-                if post_id:
-                    if post_id not in self.comments_by_post:
-                        self.comments_by_post[post_id] = []
-                    self.comments_by_post[post_id].append({
-                        "text": payload.get("text", ""),
-                        "comment_id": payload.get("source", {}).get("comment_id"),
-                    })
-        
-        total_comments = sum(len(comments) for comments in self.comments_by_post.values())
-        print(f"Loaded {total_comments} comments from Qdrant for {len(self.comments_by_post)} posts.")
+            payload = point.payload or {}
+            source = payload.get("source", {}) or {}
+            if payload.get("type") != "comment":
+                continue
+            post_id = source.get("post_id")
+            if not post_id:
+                continue
+            self.comments_by_post.setdefault(str(post_id), []).append({
+                "text": str(payload.get("text", "")).strip(),
+                "comment_id": source.get("comment_id"),
+                "created_time": payload.get("created_time"),
+            })
 
-    def retrieve(self, query: str, top_k: int | None = None) -> List[Dict[str, Any]]:
-        """Retrieve relevant documents using hybrid search (dense + sparse) or dense-only."""
-        if top_k is None:
-            top_k = self.top_k
+        total = sum(len(v) for v in self.comments_by_post.values())
+        print(f"Loaded {total} comments for {len(self.comments_by_post)} posts.")
 
+    def _encode_query(self, query: str) -> Tuple[np.ndarray, Optional[Dict[int, float]]]:
+        """Encode query into dense and optional sparse."""
         outputs = self.model.encode(
             [query],
             return_dense=True,
@@ -165,167 +201,172 @@ class RAGRetriever:
             return_colbert_vecs=False,
         )
         q_vec = np.asarray(outputs["dense_vecs"][0], dtype=np.float32)
-        dense_sims = _cosine_sim(q_vec, self.embeddings)[0]
-        
-        if self.use_hybrid and outputs.get("sparse_vecs") and self.sparse_embeddings:
-            q_sparse = outputs["sparse_vecs"][0]
-            
-            sparse_sims = np.array([
-                _sparse_sim(q_sparse, doc_sparse) 
-                for doc_sparse in self.sparse_embeddings
-            ])
-            
-            # Normalize sparse scores to [0, 1] for combination
-            if sparse_sims.max() > sparse_sims.min():
-                sparse_sims = (sparse_sims - sparse_sims.min()) / (sparse_sims.max() - sparse_sims.min())
-            else:
-                sparse_sims = np.full_like(sparse_sims, 0.5)
-            
-            # Combine dense and sparse scores
-            dense_normalized = (dense_sims + 1) / 2
-            final_scores = self.dense_weight * dense_normalized + self.sparse_weight * sparse_sims
-        else:
-            final_scores = (dense_sims + 1) / 2
-        
-        if self.min_score is not None:
-            valid_mask = final_scores >= self.min_score
-            if not valid_mask.any():
-                top_idx = np.argsort(-final_scores)[:top_k]
-            else:
-                valid_indices = np.where(valid_mask)[0]
-                valid_scores = final_scores[valid_indices]
-                top_idx = valid_indices[np.argsort(-valid_scores)[:top_k]]
-        else:
-            top_idx = np.argsort(-final_scores)[:top_k]
+        q_sparse = None
+        if self.use_hybrid and outputs.get("sparse_vecs"):
+            raw = outputs["sparse_vecs"][0]
+            if isinstance(raw, dict):
+                q_sparse = {}
+                for k, v in raw.items():
+                    try:
+                        q_sparse[int(k)] = float(v)
+                    except (TypeError, ValueError):
+                        continue
+        return q_vec, q_sparse
 
-        results: List[Dict[str, Any]] = []
-        for idx in top_idx:
-            results.append(
-                {
-                    "_id": self.doc_ids[idx],
-                    "score": float(final_scores[idx]),
-                    "dense_score": float(dense_sims[idx]),
-                    "text": self.doc_texts[idx],
-                    "source": self.doc_sources[idx],
-                }
+    def retrieve(self, query: str, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Retrieve relevant docs; dedup by post_id/permalink_url."""
+        if top_k is None:
+            top_k = self.top_k
+        if not query or not query.strip():
+            return []
+
+        q_vec, q_sparse = self._encode_query(query)
+        dense_sims = _cosine_sim(q_vec, self.embeddings)[0]
+        dense_norm = (dense_sims + 1.0) / 2.0
+
+        if self.use_hybrid and q_sparse is not None and self.sparse_embeddings:
+            sparse_sims = np.array(
+                [_sparse_sim(q_sparse, s) for s in self.sparse_embeddings],
+                dtype=np.float32,
             )
+            if sparse_sims.size > 0 and sparse_sims.max() > sparse_sims.min():
+                sparse_sims = (sparse_sims - sparse_sims.min()) / (sparse_sims.max() - sparse_sims.min() + 1e-8)
+            else:
+                sparse_sims = np.zeros_like(sparse_sims, dtype=np.float32)
+            final_scores = self.dense_weight * dense_norm + self.sparse_weight * sparse_sims
+        else:
+            final_scores = np.array(dense_norm, dtype=np.float32, copy=True)
+
+        # Exact phrase boost: query có cụm trong ngoặc kép "..." thì tăng điểm doc chứa đúng cụm đó
+        quoted_phrases = _extract_quoted_phrases(query)
+        if quoted_phrases:
+            for i, text in enumerate(self.doc_texts):
+                text_lower = (text or "").lower()
+                if all(phrase in text_lower for phrase in quoted_phrases):
+                    final_scores[i] += 0.35
+            final_scores = np.clip(final_scores, 0.0, 1.5)
+
+        if self.min_score is not None:
+            valid = np.where(final_scores >= self.min_score)[0]
+            if len(valid) == 0:
+                sorted_idx = np.argsort(-final_scores)
+            else:
+                sorted_idx = valid[np.argsort(-final_scores[valid])]
+        else:
+            sorted_idx = np.argsort(-final_scores)
+
+        seen_keys: set = set()
+        results: List[Dict[str, Any]] = []
+        for idx in sorted_idx:
+            src = self.doc_sources[idx] or {}
+            dedup_key = src.get("post_id") or src.get("permalink_url") or self.doc_ids[idx]
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
+            results.append({
+                "_id": self.doc_ids[idx],
+                "score": float(final_scores[idx]),
+                "dense_score": float(dense_sims[idx]),
+                "text": self.doc_texts[idx],
+                "source": src,
+            })
+            if len(results) >= top_k:
+                break
         return results
 
     def get_post_by_id(self, post_id: str) -> Optional[Dict[str, Any]]:
-        """Lấy post từ post_id trong Qdrant knowledge_base."""
+        """Get post by post_id from cache or Qdrant."""
         doc_id = f"post::{post_id}"
-        
-        # Tìm trong cache trước
         try:
             idx = self.doc_ids.index(doc_id)
             return {
                 "_id": self.doc_ids[idx],
                 "text": self.doc_texts[idx],
                 "source": self.doc_sources[idx],
-                "score": 1.0,  # Default score khi query trực tiếp
+                "score": 1.0,
             }
         except ValueError:
-            # Nếu không có trong cache, query từ Qdrant
-            points, _ = self.qdrant_client.scroll(
-                collection_name=self.collection_name,
-                limit=1,
-                with_payload=True,
-                with_vectors=False,
-                scroll_filter={
-                    "must": [
-                        {"key": "doc_id", "match": {"value": doc_id}}
-                    ]
-                }
-            )
-            
-            if points:
-                payload = points[0].payload
+            pass
+
+        # Scroll và tìm post theo doc_id (không dùng filter vì Qdrant Cloud cần payload index)
+        all_points = self._scroll_all_points(with_payload=True, with_vectors=False, batch_size=500)
+        for p in all_points:
+            payload = p.payload or {}
+            if payload.get("type") == "post" and payload.get("doc_id") == doc_id:
                 return {
-                    "_id": payload.get("doc_id"),
-                    "text": payload.get("text", ""),
-                    "source": payload.get("source", {}),
+                    "_id": str(payload.get("doc_id", "")),
+                    "text": str(payload.get("text", "")),
+                    "source": dict(payload.get("source", {}) or {}),
                     "score": 1.0,
                 }
-        
         return None
 
 
 def build_context(retrieved_docs: List[Dict[str, Any]]) -> str:
-    """Format retrieved documents into a context string for LLM."""
+    """Format retrieved documents into context string for LLM."""
     parts = []
     for i, d in enumerate(retrieved_docs, start=1):
-        meta = d.get("source", {})
+        meta = d.get("source", {}) or {}
         link = meta.get("permalink_url") or ""
-        dense_score = d.get("dense_score")
-        if dense_score is not None:
+        ds = d.get("dense_score")
+        if ds is not None:
             parts.append(
-                f"[DOC {i}] final_score={d['score']:.3f} (dense={dense_score:.3f})\n"
-                f"text: {d['text']}\n"
-                f"source: {link}\n"
+                f"[DOC {i}] score={d['score']:.3f} (dense={ds:.3f})\n"
+                f"text: {d.get('text', '')}\nsource: {link}\n"
             )
         else:
             parts.append(
-                f"[DOC {i}] score={d['score']:.3f}\n"
-                f"text: {d['text']}\n"
-                f"source: {link}\n"
+                f"[DOC {i}] score={d['score']:.3f}\ntext: {d.get('text', '')}\nsource: {link}\n"
             )
     return "\n\n".join(parts)
 
 
 def build_single_context(doc: Dict[str, Any], retriever: Optional["RAGRetriever"] = None) -> str:
-    """
-    Format a single document (post) and its comments into context string for LLM.
-    
-    Args:
-        doc: Document dictionary (should be a post)
-        retriever: RAGRetriever instance to access comments cache
-    """
-    meta = doc.get("source", {})
+    """Format one post and limited comments for LLM."""
+    meta = doc.get("source", {}) or {}
     link = meta.get("permalink_url") or ""
     post_id = meta.get("post_id")
-    
+
     context_parts = [
         "=== BAI VIET ===",
-        f"text: {doc['text']}",
+        f"text: {doc.get('text', '')}",
         f"source: {link}",
     ]
-    
-    # Lấy comments của bài viết này nếu có retriever và post_id
-    comments_text = []
-    if retriever and post_id and hasattr(retriever, 'comments_by_post'):
+
+    if retriever and post_id and hasattr(retriever, "comments_by_post"):
         comments = retriever.comments_by_post.get(post_id, [])
+        comments = [c for c in comments if c.get("text") and c.get("text") != "[NO_MESSAGE]"]
+        limit = getattr(retriever, "comment_limit", 8)
         if comments:
-            comments_text.append("\n=== COMMENTS ===")
-            for i, cmt in enumerate(comments, start=1):
-                comment_text = cmt.get("text", "").strip()
-                if comment_text and comment_text != "[NO_MESSAGE]":
-                    comments_text.append(f"Comment {i}: {comment_text}")
-    
-    if comments_text:
-        context_parts.extend(comments_text)
-    
+            context_parts.append("\n=== COMMENTS ===")
+            for cmt in comments[:limit]:
+                text = cmt.get("text", "").strip()
+                snippet = text[:60] + "..." if len(text) > 60 else text
+                context_parts.append(f"Bình luận ({snippet}): {text}")
+            if len(comments) > limit:
+                context_parts.append(f"[GHI CHÚ] Còn {len(comments) - limit} bình luận khác không đưa vào context.")
+
     return "\n".join(context_parts)
 
 
 def build_prompt(user_question: str, context: str) -> str:
-    """Build prompt for LLM (compatible with Gemini, OpenAI, Groq, etc.)."""
+    """Build prompt for LLM."""
     return (
         "Bạn là trợ lý AI thân thiện của nhóm sinh viên, giúp tóm tắt và trả lời câu hỏi "
         "dựa trên các bài đăng và bình luận trong nhóm.\n\n"
         "NHIỆM VỤ:\n"
-        "1. Đọc kỹ các tài liệu (documents) được cung cấp trong phần CONTEXT bên dưới.\n"
-        "2. Tổng hợp thông tin theo thứ tự ưu tiên: bài viết gốc → comments có nội dung cụ thể.\n"
-        "3. Nếu có ý kiến trái chiều, trình bày cả hai phía một cách công bằng.\n"
-        "4. Trả lời ngắn gọn, dễ hiểu, thân thiện (2-3 đoạn văn).\n\n"
+        "1. Đọc kỹ tài liệu trong CONTEXT.\n"
+        "2. Ưu tiên thông tin từ bài viết gốc, sau đó mới dùng bình luận liên quan cùng bài.\n"
+        "3. Nếu có ý kiến trái chiều, trình bày cân bằng.\n"
+        "4. Trả lời ngắn gọn, rõ ràng, thân thiện.\n\n"
         "QUY TẮC:\n"
-        "- CHỈ sử dụng thông tin có trong CONTEXT, TUYỆT ĐỐI không suy đoán hoặc bịa nội dung.\n"
-        "- Nội dung từ COMMENTS chỉ được sử dụng khi thuộc đúng bài viết đang được trả lời.\n"
-        '- LUÔN trích dẫn nguồn: dùng "[DOC X]" nếu context có nhiều tài liệu, '
-        'hoặc "[Bài viết]" / "[Comment]" nếu context chỉ có một bài viết.\n'
-        "- Nếu không tìm thấy thông tin liên quan trong CONTEXT, hãy trả lời: "
+        "- CHỈ dùng thông tin có trong CONTEXT.\n"
+        "- Không bịa, không suy đoán.\n"
+        '- Khi nhắc đến bình luận, viết tự nhiên: "một bình luận cho biết..." hoặc "một ý kiến khác nói rằng...".\n'
+        '- Dùng "[Bài viết]" khi nói về nội dung chính của post.\n'
+        '- Nếu CONTEXT không đủ thông tin, trả lời: '
         '"Mình không thấy thông tin về vấn đề này trong nhóm. Bạn có thể hỏi cụ thể hơn không?"\n\n'
         f"=== CONTEXT ===\n{context}\n\n"
         f"=== CÂU HỎI ===\n{user_question}\n\n"
         "=== TRẢ LỜI ===\n"
     )
-

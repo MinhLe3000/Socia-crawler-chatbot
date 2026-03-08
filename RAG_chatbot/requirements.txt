@@ -4,14 +4,19 @@ transformers==4.44.2
 FlagEmbedding>=1.2.10
 pymongo>=4.10.0
 python-dotenv>=1.0.1
-numpy>=1.26.0
+# NumPy 2.x không tương thích với torch/tensorflow/FlagEmbedding (build với NumPy 1.x)
+numpy>=1.26.0,<2
 google-generativeai>=0.8.0
-# Fix lỗi protobuf với transformers
-protobuf>=4.21.0,<6.0.0
+# Fix lỗi protobuf với transformers + TensorFlow
+protobuf>=4.21.0,<5
+# Transformers 4.44 cần tf-keras (Keras 2 compatible) khi có TensorFlow
+tf-keras>=2.16
 # Flask API
 flask>=2.3.0
 flask-cors>=4.0.0
 # Qdrant vector database
 qdrant-client>=1.7.0
+# Streamlit UI (Pipeline Runner + Semantic Search)
+streamlit>=1.28.0
 
 

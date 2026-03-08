@@ -26,6 +26,31 @@ def build_knowledge_documents() -> int:
     source_db = mongo_client[MONGO_DB_SOURCE]
     posts_col = source_db["posts"]
     comments_col = source_db["comments"]
+
+    # Cache all posts in memory so we can reuse both for
+    # - indexing post documents
+    # - building comment_context (need post.message)
+    posts = list(posts_col.find())
+
+    # Map post_id -> post_message (cleaned)
+    post_messages = {}
+    for post in posts:
+        pid = str(post.get("_id"))
+        msg = (post.get("message") or "").strip()
+        if msg:
+            post_messages[pid] = msg
+
+    # post_id -> list of comment texts (chỉ comment đủ dài, để build thread_summary)
+    comments_by_post: Dict[str, List[str]] = {}
+    for cmt in comments_col.find():
+        post_id_str = str(cmt.get("post_id")) if cmt.get("post_id") else None
+        if not post_id_str:
+            continue
+        raw = (cmt.get("message") or "").strip()
+        if raw and len(raw) > 10:
+            if post_id_str not in comments_by_post:
+                comments_by_post[post_id_str] = []
+            comments_by_post[post_id_str].append(raw)
     
     # Tạo Qdrant collection nếu chưa tồn tại
     # BGE-M3 model có 1024 dimensions
@@ -60,7 +85,10 @@ def build_knowledge_documents() -> int:
     points: List[PointStruct] = []
     point_id = 0
 
-    for post in posts_col.find():
+    # ============================
+    # Index posts
+    # ============================
+    for post in posts:
         post_id = str(post.get("_id"))
         message = (post.get("message") or "").strip()
         if not message:
@@ -73,14 +101,15 @@ def build_knowledge_documents() -> int:
             "source": {
                 "post_id": post_id,
                 "permalink_url": post.get("permalink_url"),
+                "thread_id": post_id,
             },
             "created_time": str(post.get("created_time")) if post.get("created_time") else None,
             "fetched_at": str(post.get("fetched_at")) if post.get("fetched_at") else None,
         }
-        
+
         # Tạo zero vector tạm thời (sẽ được update bởi embed_bge_m3.py)
         zero_vector = np.zeros(1024, dtype=np.float32).tolist()
-        
+
         points.append(
             PointStruct(
                 id=point_id,
@@ -90,32 +119,108 @@ def build_knowledge_documents() -> int:
         )
         point_id += 1
 
+    # ============================
+    # Index comments + comment_context
+    # ============================
     for cmt in comments_col.find():
         comment_id = str(cmt.get("_id"))
-        message = (cmt.get("message") or "").strip()
-        if not message:
-            message = "[NO_MESSAGE]"
+        raw_message = (cmt.get("message") or "").strip()
+        message = raw_message if raw_message else "[NO_MESSAGE]"
 
-        payload = {
+        post_id = cmt.get("post_id")
+        post_id_str = str(post_id) if post_id is not None else None
+
+        # Base comment document (giữ nguyên để build COMMENTS context)
+        payload_comment = {
             "doc_id": f"comment::{comment_id}",
             "type": "comment",
             "text": message,
             "source": {
-                "post_id": cmt.get("post_id"),
+                "post_id": post_id_str,
                 "comment_id": comment_id,
                 "permalink_url": cmt.get("permalink_url"),
+                "thread_id": post_id_str,
             },
             "created_time": str(cmt.get("created_time")) if cmt.get("created_time") else None,
             "fetched_at": str(cmt.get("fetched_at")) if cmt.get("fetched_at") else None,
         }
-        
+
         zero_vector = np.zeros(1024, dtype=np.float32).tolist()
-        
+
         points.append(
             PointStruct(
                 id=point_id,
                 vector=zero_vector,
-                payload=payload,
+                payload=payload_comment,
+            )
+        )
+        point_id += 1
+
+        # Comment_context document: Bài viết + Bình luận (chỉ với comment đủ dài)
+        post_message = post_messages.get(post_id_str, "")
+        if raw_message and len(raw_message) > 10 and post_message:
+            text_context = f"Bài viết: {post_message}\nBình luận: {raw_message}"
+
+            payload_comment_context = {
+                "doc_id": f"comment_context::{comment_id}",
+                "type": "comment_context",
+                "text": text_context,
+                "source": {
+                    "post_id": post_id_str,
+                    "comment_id": comment_id,
+                    "permalink_url": cmt.get("permalink_url"),
+                    "thread_id": post_id_str,
+                },
+                "created_time": str(cmt.get("created_time")) if cmt.get("created_time") else None,
+                "fetched_at": str(cmt.get("fetched_at")) if cmt.get("fetched_at") else None,
+            }
+
+            points.append(
+                PointStruct(
+                    id=point_id,
+                    vector=zero_vector,
+                    payload=payload_comment_context,
+                )
+            )
+            point_id += 1
+
+    # ============================
+    # Index thread_summary (1 doc/thread: post + các ý chính từ comment)
+    # ============================
+    for post in posts:
+        post_id = str(post.get("_id"))
+        post_message = post_messages.get(post_id, "").strip() or "[NO_MESSAGE]"
+        comment_texts = comments_by_post.get(post_id, [])
+
+        lines = [f"Thread: {post_message}"]
+        if comment_texts:
+            lines.append("Các ý chính từ bình luận:")
+            for c in comment_texts:
+                lines.append(f"- {c}")
+        else:
+            lines.append("Các ý chính từ bình luận: (chưa có)")
+
+        text_summary = "\n".join(lines)
+
+        payload_thread = {
+            "doc_id": f"thread_summary::{post_id}",
+            "type": "thread_summary",
+            "text": text_summary,
+            "source": {
+                "post_id": post_id,
+                "permalink_url": post.get("permalink_url"),
+                "thread_id": post_id,
+            },
+            "created_time": str(post.get("created_time")) if post.get("created_time") else None,
+            "fetched_at": str(post.get("fetched_at")) if post.get("fetched_at") else None,
+        }
+
+        zero_vector = np.zeros(1024, dtype=np.float32).tolist()
+        points.append(
+            PointStruct(
+                id=point_id,
+                vector=zero_vector,
+                payload=payload_thread,
             )
         )
         point_id += 1

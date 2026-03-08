@@ -43,8 +43,8 @@ def embed_knowledge_base(
         print("  - Sparse embeddings: ON (hybrid search)")
 
     updated = 0
-    updated_points: List[PointStruct] = []
-    
+    # Upsert từng batch (16 points) để tránh WriteTimeout khi gửi 1000+ points một lần
+
     for i in range(0, total, batch_size):
         batch = points[i : i + batch_size]
         texts: List[str] = [str(p.payload.get("text", "")) for p in batch]
@@ -58,22 +58,22 @@ def embed_knowledge_base(
         dense_vectors = outputs["dense_vecs"]
         sparse_vectors = outputs.get("sparse_vecs", []) if use_sparse else []
 
+        batch_points: List[PointStruct] = []
         for idx, (point, vec) in enumerate(zip(batch, dense_vectors)):
             # Convert to float32 to reduce storage size
             vec32 = np.asarray(vec, dtype=np.float32).tolist()
-            
+
             # Update payload với thông tin embedding
             updated_payload = dict(point.payload)
             updated_payload["embedding_model"] = "BAAI/bge-m3"
             updated_payload["embedding_dim"] = len(vec32)
-            
+
             if use_sparse and sparse_vectors:
                 sparse_dict = sparse_vectors[idx]
                 sparse_dict_clean = {int(k): float(v) for k, v in sparse_dict.items()}
                 updated_payload["sparse_embedding"] = sparse_dict_clean
-            
-            # Tạo point mới với vector đã embed
-            updated_points.append(
+
+            batch_points.append(
                 PointStruct(
                     id=point.id,
                     vector=vec32,
@@ -82,15 +82,15 @@ def embed_knowledge_base(
             )
             updated += 1
 
-        print(f"Processed {min(i + batch_size, total)}/{total} documents")
+        # Ghi lên Qdrant ngay từng batch nhỏ, tránh timeout
+        if batch_points:
+            qdrant_client.upsert(
+                collection_name=collection_name,
+                points=batch_points,
+                wait=True,
+            )
 
-    # Upload tất cả points đã cập nhật vào Qdrant
-    if updated_points:
-        qdrant_client.upsert(
-            collection_name=collection_name,
-            points=updated_points,
-            wait=True,
-        )
+        print(f"Processed {min(i + batch_size, total)}/{total} documents")
     
     print(f"Hoan thanh. Da cap nhat embedding cho {updated} documents trong Qdrant.")
     return updated

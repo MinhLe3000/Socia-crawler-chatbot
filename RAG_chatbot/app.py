@@ -202,14 +202,16 @@ async def chat(request: ChatRequest) -> Dict[str, Any]:
         except Exception as exc:
             answer = f"Lỗi khi gọi Gemini: {str(exc)}"
 
-        # Build sources list
+        # Build sources list (deduplicate theo permalink_url — nhiều hit có thể cùng 1 post)
         sources: List[Dict[str, str]] = []
+        seen_links: set[str] = set()
         if top_score >= MIN_SCORE_THRESHOLD:
-            # Add main source (post used for answer)
+            # Bài chính (post dùng để trả lời)
             if post_doc:
                 top_src = post_doc.get("source", {})
                 top_link = top_src.get("permalink_url", "")
-                if top_link:
+                if top_link and top_link not in seen_links:
+                    seen_links.add(top_link)
                     txt = post_doc.get("text", "") or ""
                     sources.append(
                         {
@@ -218,11 +220,12 @@ async def chat(request: ChatRequest) -> Dict[str, Any]:
                         }
                     )
 
-            # Add related sources (other docs)
-            for d in docs[1:]:  # Skip first one (already added)
+            # Bài liên quan (chỉ thêm post khác, bỏ trùng link)
+            for d in docs[1:]:
                 src = d.get("source", {})
                 link = src.get("permalink_url", "")
-                if link:
+                if link and link not in seen_links:
+                    seen_links.add(link)
                     txt = d.get("text", "") or ""
                     sources.append(
                         {
@@ -250,7 +253,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "app:app",
         host="0.0.0.0",
-        port=5000,
+        port=5001,  # 5000 trên macOS thường bị AirPlay chiếm
         reload=False,
     )
 

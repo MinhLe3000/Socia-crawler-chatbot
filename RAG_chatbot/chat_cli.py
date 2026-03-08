@@ -120,15 +120,14 @@ def main() -> None:
                 answer = f"Loi khi goi Gemini: {exc}"
             print(answer)
 
-        # Hiển thị link bài viết đã dùng để trả lời (top 1) và các bài viết liên quan
+        # Hiển thị link bài viết đã dùng + các bài viết liên quan (dedup theo URL)
         if top_score >= MIN_SCORE_THRESHOLD:
-            # Xác định post để hiển thị link (có thể top_doc là post hoặc comment)
+            # Xác định post chính
             post_doc = None
             doc_id = top_doc.get("_id", "")
             if isinstance(doc_id, str) and doc_id.startswith("post::"):
                 post_doc = top_doc
             else:
-                # Nếu top_doc là comment, tìm post tương ứng
                 post_id = top_doc.get("source", {}).get("post_id")
                 if post_id:
                     for d in docs:
@@ -139,25 +138,23 @@ def main() -> None:
                                 break
                     if not post_doc:
                         post_doc = retriever.get_post_by_id(post_id)
-            
-            # Hiển thị link của bài viết đã dùng để trả lời
-            if post_doc:
-                top_src = post_doc.get("source", {})
-                top_link = top_src.get("permalink_url", "")
-                if top_link:
-                    print("\n--- Bài viết đã dùng để trả lời ---")
-                    print(f"1. {top_link}")
-            
-            # Hiển thị các bài viết liên quan (từ bài 2 trở đi)
-            if len(docs) > 1:
+
+            top_link = (post_doc.get("source", {}) or {}).get("permalink_url", "") if post_doc else ""
+            seen_links = {top_link} if top_link else set()
+            unique_related: list = []
+            for d in docs:
+                link = (d.get("source", {}) or {}).get("permalink_url", "")
+                if link and link not in seen_links:
+                    seen_links.add(link)
+                    unique_related.append(link)
+
+            if top_link:
+                print("\n--- Bài viết đã dùng để trả lời ---")
+                print(f"1. {top_link}")
+            if unique_related:
                 print("\n--- Các bài viết liên quan ---")
-                for i, d in enumerate(docs[1:], start=2):  # Bắt đầu từ bài thứ 2
-                    src = d.get("source", {})
-                    link = src.get("permalink_url", "")
-                    if link:
-                        print(f"{i}. {link}")
-                    else:
-                        print(f"{i}. [Không có link]")
+                for i, link in enumerate(unique_related, start=2):
+                    print(f"{i}. {link}")
 
 
 if __name__ == "__main__":
