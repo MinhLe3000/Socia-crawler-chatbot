@@ -36,17 +36,31 @@ def embed_knowledge_base(
         print(f"No documents found in Qdrant collection '{collection_name}'. Please run index_mongo.py first.")
         return 0
 
-    total = len(points)
-    print(f"Starting embedding generation for {total} documents using BGE-M3...")
+    pending_points = [
+        p for p in points
+        if not (
+            p.vector
+            and isinstance(p.vector, list)
+            and any(abs(float(x)) > 1e-9 for x in p.vector)
+            and (p.payload or {}).get("embedding_model") == "BAAI/bge-m3"
+        )
+    ]
+
+    total = len(pending_points)
+    print(f"Starting embedding generation for {total} pending documents using BGE-M3...")
     print("  - Dense embeddings: ON")
     if use_sparse:
         print("  - Sparse embeddings: ON (hybrid search)")
+
+    if total == 0:
+        print("All documents already have embeddings.")
+        return 0
 
     updated = 0
     # Upsert từng batch (16 points) để tránh WriteTimeout khi gửi 1000+ points một lần
 
     for i in range(0, total, batch_size):
-        batch = points[i : i + batch_size]
+        batch = pending_points[i : i + batch_size]
         texts: List[str] = [str(p.payload.get("text", "")) for p in batch]
 
         outputs = model.encode(
@@ -90,7 +104,7 @@ def embed_knowledge_base(
                 wait=True,
             )
 
-        print(f"Processed {min(i + batch_size, total)}/{total} documents")
+        print(f"Processed {min(i + batch_size, total)}/{total} documents", flush=True)
     
     print(f"Hoan thanh. Da cap nhat embedding cho {updated} documents trong Qdrant.")
     return updated

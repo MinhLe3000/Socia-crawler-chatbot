@@ -229,12 +229,18 @@ def build_knowledge_documents() -> int:
         print("No posts/comments found in MongoDB.")
         return 0
 
-    # Upload points vào Qdrant
-    qdrant_client.upsert(
-        collection_name=QDRANT_COLLECTION_NAME,
-        points=points,
-        wait=True,
-    )
+    # Upload theo batch nhỏ để tránh timeout với Qdrant Cloud.
+    batch_size = 100
+    inserted = 0
+    for i in range(0, len(points), batch_size):
+        batch = points[i : i + batch_size]
+        qdrant_client.upsert(
+            collection_name=QDRANT_COLLECTION_NAME,
+            points=batch,
+            wait=True,
+        )
+        inserted += len(batch)
+        print(f"Uploaded {inserted}/{len(points)} points to Qdrant...")
     
     print(f"Inserted {len(points)} documents into Qdrant collection '{QDRANT_COLLECTION_NAME}'.")
     print("Note: Vectors are initialized as zeros. Run embed_bge_m3.py to generate actual embeddings.")
